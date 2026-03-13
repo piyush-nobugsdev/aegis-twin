@@ -10,7 +10,6 @@ import os
 
 import pandas as pd
 import streamlit as st
-import streamlit.components.v1 as components
 from dotenv import load_dotenv
 import folium
 from streamlit_folium import st_folium
@@ -64,13 +63,14 @@ for k, v in SESSION_DEFAULTS.items():
 # ---------------------------------------------------------------------------
 if not st.session_state.authenticated:
     render_login_page()
+    st.stop()
 
 # ---------------------------------------------------------------------------
 # Model
 # ---------------------------------------------------------------------------
 @st.cache_resource
 def load_aegis_engine():
-    import os
+    import torch
     model = LSTMAutoencoder()
     weights_path = "aegis_model.pth"
     if os.path.exists(weights_path):
@@ -90,19 +90,10 @@ autoencoder = load_aegis_engine()
 # PAGE 1 — Fleet overview
 # ---------------------------------------------------------------------------
 def render_fleet_page():
-    # --- Navigation reading from query params ---
-    if "device" in st.query_params:
-        dev_id = st.query_params.get("device")
-        if dev_id in IOT_REGISTRY:
-            st.session_state.active_device  = dev_id
-            st.session_state.page           = "dashboard"
-            st.session_state.packet_history = pd.DataFrame(columns=["Time","Pkt Size","IAT","Entropy","Symmetry","Status"])
-            st.session_state.threat_log     = []
-            st.query_params.clear()
-            st.rerun()
 
     st.markdown("<h1 style='text-align:center;color:white;'>🌐 Enterprise Fleet Manager</h1>", unsafe_allow_html=True)
-    st.markdown("<p style='text-align:center;color:#aaa;'>Click a hotspot on the map to open its Digital Twin dashboard. <span style='color:#00ff88'>● Green = Healthy</span> | <span style='color:#ff2d55'>● Red = Compromised</span></p>", unsafe_allow_html=True)
+    st.markdown("<p style='text-align:center;color:#aaa;'>Click a hotspot on the map or a row in the registry to open its Digital Twin dashboard. <span style='color:#00ff88'>● Green = Healthy</span> | <span style='color:#ff2d55'>● Red = Compromised</span></p>", unsafe_allow_html=True)
+
     # --- Ticker Banner ---
     ticker_text = "⬡ SYSTEM ONLINE · 10 NODES ACTIVE · SECTOR: RR NAGAR, BENGALURU · LSTM AUTOENCODER: RUNNING · DIGITAL TWINS: SYNCHRONIZED · THREAT LEVEL: NOMINAL · ENCRYPTION: AES-256-GCM · UPTIME: 99.98% · ANOMALY DETECTION: ENABLED · RECONSTRUCTION ERROR: NOMINAL · JSD DIVERGENCE: 0.00 ⬡"
     st.markdown(f"""
@@ -125,16 +116,18 @@ def render_fleet_page():
     center_lat, center_lon = 12.9026, 77.5001
     m = folium.Map(location=[center_lat, center_lon], zoom_start=15, tiles="cartodb dark_matter", zoom_control=True)
 
-    # Build Registry Rows HTML dynamically
-    rows_html = ""
+    # --- Counters for registry header ---
+    total_devices     = len(IOT_REGISTRY)
+    compromised_count = sum(1 for dev_id in IOT_REGISTRY if st.session_state.device_health.get(dev_id, "Healthy") != "Healthy")
+    healthy_count     = total_devices - compromised_count
+
+    # Build map markers
     for idx, (dev_id, info) in enumerate(IOT_REGISTRY.items()):
-        health = st.session_state.device_health.get(dev_id, "Healthy")
-        color = NEON_GREEN if health == "Healthy" else NEON_RED
+        health         = st.session_state.device_health.get(dev_id, "Healthy")
+        color          = NEON_GREEN if health == "Healthy" else NEON_RED
         is_compromised = health != "Healthy"
-        
-        # CSS for pulsing effect
-        pulse_class = "map-pulsing-marker" if is_compromised else "map-static-marker"
-        
+        pulse_class    = "map-pulsing-marker" if is_compromised else "map-static-marker"
+
         tooltip_html = f"""
         <div style="font-family:'Inter',sans-serif; background:rgba(17,25,40,0.95); color:white; padding:12px; border:1px solid {color}; border-radius:8px; box-shadow:0 0 10px {color}66; min-width:180px;">
             <div style="font-size:1.5rem; margin-bottom:5px;">{info['icon']}</div>
@@ -151,7 +144,6 @@ def render_fleet_page():
         </div>
         """
 
-        # Custom Icon with HTML/CSS for glowing/pulsing effect
         icon_html = f"""
         <div class="{pulse_class}" style="
             background-color: {color};
@@ -163,7 +155,7 @@ def render_fleet_page():
             cursor: pointer;
         "></div>
         """
-        
+
         folium.Marker(
             location=[info['lat'], info['lon']],
             popup=folium.Popup(tooltip_html, max_width=300),
@@ -173,24 +165,10 @@ def render_fleet_page():
                 icon_anchor=(10, 10),
                 html=icon_html,
             ),
-            custom_id=dev_id 
+            custom_id=dev_id
         ).add_to(m)
 
-        # Build registry panel row
-        status_text = "● ONLINE" if not is_compromised else "● CRITICAL"
-        status_style = f"color: {color}; font-weight: bold;"
-        if is_compromised:
-            status_style += " animation: blinker 1s linear infinite;"
-        
-        bg_color = "rgba(255,255,255,0.02)" if idx % 2 == 0 else "transparent"
-        rows_html += f'<tr class="registry-row" onclick="window.parent.location.href=\'?device={dev_id}\'" style="background: {bg_color}; border-bottom: 1px solid rgba(255,255,255,0.04); cursor: pointer; transition: background 0.2s ease;">' \
-                     f'<td style="padding: 12px; font-family: \'Source Code Pro\', monospace; color: #00cfff;">{info["icon"]} {dev_id}</td>' \
-                     f'<td style="padding: 12px; color: white;">{info["name"]}</td>' \
-                     f'<td style="padding: 12px; color: #888; font-size: 0.9em;">{info["type"]}</td>' \
-                     f'<td style="padding: 12px; {status_style}">{status_text}</td>' \
-                     f'</tr>'
-
-    # Custom CSS for the map markers
+    # Custom CSS for map markers
     st.markdown("""
     <style>
     @keyframes map-pulse {
@@ -198,122 +176,93 @@ def render_fleet_page():
         70% { transform: scale(1.1); box-shadow: 0 0 0 15px rgba(255, 45, 85, 0); }
         100% { transform: scale(0.9); box-shadow: 0 0 0 0 rgba(255, 45, 85, 0); }
     }
-    .map-pulsing-marker {
-        animation: map-pulse 1.5s infinite;
-    }
-    .map-static-marker:hover {
-        transform: scale(1.2);
-        transition: transform 0.2s ease;
-    }
+    .map-pulsing-marker { animation: map-pulse 1.5s infinite; }
+    .map-static-marker:hover { transform: scale(1.2); transition: transform 0.2s ease; }
     </style>
     """, unsafe_allow_html=True)
 
     with col_map:
-        # Display map
         output = st_folium(m, width="100%", height=500, key="fleet_map")
 
     with col_reg:
-        # Display Registry Panel using components.html so JS executes in a real iframe
-        # (st.markdown sandboxes JS; components.html gives a proper browsing context
-        #  where oninput filtering and window.parent.location.href navigation both work)
-        registry_html = f"""
-<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
-<link href="https://fonts.googleapis.com/css2?family=Source+Code+Pro:wght@400;600&display=swap" rel="stylesheet">
-<style>
-  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-  body {{ background: transparent; font-family: 'Source Code Pro', monospace; }}
-  #deviceSearch {{
-    width: 100%;
-    background: rgba(0,255,242,0.03);
-    border: none;
-    border-bottom: 1px solid rgba(0,255,242,0.3);
-    color: #00fff2;
-    font-family: 'Source Code Pro', monospace;
-    font-size: 0.85rem;
-    padding: 10px;
-    outline: none;
-    transition: all 0.3s ease;
-  }}
-  #deviceSearch::placeholder {{ color: rgba(0,255,242,0.5); }}
-  #deviceSearch:focus {{
-    border-bottom: 1px solid #00fff2;
-    box-shadow: 0 5px 15px rgba(0,255,242,0.2);
-    background: rgba(0,255,242,0.1);
-  }}
-  .registry-row {{ transition: background 0.2s ease; cursor: pointer; }}
-  .registry-row:hover {{ background: rgba(0,255,242,0.06) !important; }}
-  table {{ width: 100%; border-collapse: collapse; font-size: 0.85rem; }}
-  th {{ padding: 10px; text-align: left; color: #555; border-bottom: 1px solid rgba(0,255,242,0.2); position: sticky; top: 0; background: #080e1c; z-index: 1; }}
-  td {{ padding: 12px; }}
-  @keyframes blinker {{ 50% {{ opacity: 0; }} }}
-</style>
-</head>
-<body>
-<div style="background: rgba(8,14,28,0.85); backdrop-filter: blur(20px); border: 1px solid rgba(0,255,242,0.15); border-radius: 12px; padding: 20px; height: 498px; display: flex; flex-direction: column;">
-  <div style="font-family: 'Source Code Pro', monospace; color: #00fff2; font-size: 1.1rem; margin-bottom: 15px; letter-spacing: 1px;">
-    // DEVICE REGISTRY
-  </div>
-  <div style="margin-bottom: 12px;">
-    <input type="text" id="deviceSearch" oninput="filterRegistry()" placeholder="\U0001f50d Search devices...">
-  </div>
-  <div style="overflow-y: auto; flex-grow: 1;">
-    <table>
-      <thead>
-        <tr>
-          <th>ID</th>
-          <th>NAME</th>
-          <th>TYPE</th>
-          <th>STATUS</th>
-        </tr>
-      </thead>
-      <tbody id="registryBody">
-        {rows_html}
-        <tr id="noResultsRow" style="display:none;">
-          <td colspan="4" style="padding:30px; text-align:center; color:#555; font-family:'Source Code Pro',monospace;">
-            // NO DEVICES FOUND
-          </td>
-        </tr>
-      </tbody>
-    </table>
-  </div>
-</div>
-<script>
-function filterRegistry() {{
-  var query = document.getElementById('deviceSearch').value.toLowerCase();
-  var rows  = document.querySelectorAll('.registry-row');
-  var found = false;
-  rows.forEach(function(row) {{
-    var text = row.innerText.toLowerCase();
-    if (text.indexOf(query) !== -1) {{
-      row.style.display = '';
-      found = true;
-    }} else {{
-      row.style.display = 'none';
-    }}
-  }});
-  document.getElementById('noResultsRow').style.display = found ? 'none' : '';
-}}
-</script>
-</body>
-</html>
-"""
-        components.html(registry_html, height=520, scrolling=False)
+        st.markdown(f"""
+        <div style="background:rgba(8,14,28,0.85);backdrop-filter:blur(20px);border:1px solid rgba(0,255,242,0.15);
+                    border-radius:12px;padding:20px 20px 10px 20px;margin-bottom:8px;">
+            <div style="font-family:'Source Code Pro',monospace;color:#00fff2;font-size:1.1rem;
+                        margin-bottom:12px;letter-spacing:1px;">// DEVICE REGISTRY</div>
+            <div style="display:flex;gap:10px;margin-bottom:4px;">
+                <div style="flex:1;background:rgba(0,255,136,0.08);border:1px solid rgba(0,255,136,0.3);
+                            border-radius:8px;padding:8px 12px;text-align:center;">
+                    <div style="color:#00ff88;font-size:1.4rem;font-weight:bold;">{total_devices}</div>
+                    <div style="color:#aaa;font-size:0.75rem;">TOTAL</div>
+                </div>
+                <div style="flex:1;background:rgba(0,255,136,0.08);border:1px solid rgba(0,255,136,0.3);
+                            border-radius:8px;padding:8px 12px;text-align:center;">
+                    <div style="color:#00ff88;font-size:1.4rem;font-weight:bold;">{healthy_count}</div>
+                    <div style="color:#aaa;font-size:0.75rem;">ACTIVE</div>
+                </div>
+                <div style="flex:1;background:rgba(255,45,85,0.08);border:1px solid rgba(255,45,85,0.3);
+                            border-radius:8px;padding:8px 12px;text-align:center;">
+                    <div style="color:#ff2d55;font-size:1.4rem;font-weight:bold;">{compromised_count}</div>
+                    <div style="color:#aaa;font-size:0.75rem;">CRITICAL</div>
+                </div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
 
-    # Handle click navigation
+        # Search box
+        search_query = st.text_input(
+            "", placeholder="🔍 Search devices...",
+            key="registry_search",
+            label_visibility="collapsed",
+        )
+
+        # Column headers (outside scroll container)
+        h1, h2, h3, h4, h5 = st.columns([1, 1.8, 2.2, 1.8, 1.2])
+        for col, label in zip([h1, h2, h3, h4, h5], ["", "ID", "NAME", "TYPE", "STATUS"]):
+            col.markdown(f"<span style='color:#555;font-size:0.78em;font-family:monospace;'>{label}</span>", unsafe_allow_html=True)
+        st.markdown("<hr style='margin:2px 0 4px 0;border-color:rgba(0,255,242,0.15);'>", unsafe_allow_html=True)
+
+        # st.container(height=N) is the ONLY reliable way to scroll native Streamlit widgets
+        scroll_box = st.container(height=310, border=False)
+
+        with scroll_box:
+            any_shown = False
+            for dev_id, info in IOT_REGISTRY.items():
+                search_text = f"{dev_id} {info['name']} {info['type']}".lower()
+                if search_query and search_query.lower() not in search_text:
+                    continue
+                any_shown = True
+                health     = st.session_state.device_health.get(dev_id, "Healthy")
+                color      = NEON_GREEN if health == "Healthy" else NEON_RED
+                status_txt = "● ONLINE" if health == "Healthy" else "● CRITICAL"
+
+                cb, c1, c2, c3, c4 = st.columns([1, 1.8, 2.2, 1.8, 1.2])
+                with cb:
+                    if st.button("▶", key=f"reg_nav_{dev_id}", help=f"Open {info['name']}"):
+                        st.session_state.active_device = dev_id
+                        st.session_state.page          = "dashboard"
+                        st.rerun()
+                c1.markdown(f"<span style='color:#00cfff;font-family:monospace;font-size:0.8em;'>{dev_id}</span>", unsafe_allow_html=True)
+                c2.markdown(f"<span style='color:white;font-size:0.8em;'>{info['icon']} {info['name']}</span>", unsafe_allow_html=True)
+                c3.markdown(f"<span style='color:#888;font-size:0.78em;'>{info['type']}</span>", unsafe_allow_html=True)
+                c4.markdown(f"<span style='color:{color};font-size:0.78em;font-weight:bold;'>{status_txt}</span>", unsafe_allow_html=True)
+                st.markdown("<hr style='margin:1px 0;border-color:rgba(255,255,255,0.04);'>", unsafe_allow_html=True)
+
+            if not any_shown:
+                st.markdown("<p style='color:#555;text-align:center;font-family:monospace;padding:20px;'>// NO DEVICES FOUND</p>", unsafe_allow_html=True)
+
+    # --- Handle map click navigation ---
     if output and output.get("last_object_clicked"):
-        # We need to find which device was clicked based on coordinates if custom_id doesn't propagate easily
         click_lat = output["last_object_clicked"]["lat"]
         click_lon = output["last_object_clicked"]["lng"]
-        
+
         clicked_dev_id = None
         for dev_id, info in IOT_REGISTRY.items():
             if abs(info['lat'] - click_lat) < 0.0001 and abs(info['lon'] - click_lon) < 0.0001:
                 clicked_dev_id = dev_id
                 break
-        
+
         if clicked_dev_id:
             st.session_state.active_device = clicked_dev_id
             st.session_state.page          = "dashboard"
@@ -419,7 +368,6 @@ elif page == "dashboard":
     render_device_dashboard(autoencoder)
     st.stop()
 elif page == "hardware_dashboard":
-    from hardware_dashboard import render_hardware_dashboard
     render_hardware_dashboard(autoencoder)
     st.stop()
 else:
