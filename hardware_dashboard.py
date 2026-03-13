@@ -155,21 +155,37 @@ _HW_RE_HIST     = "hw_reconstruction_errors_history"
 _HW_MATH_MODE   = "hw_math_mode_active"
 
 
-def _init_hw_session() -> None:
-    """Ensure all hardware-specific session-state keys exist."""
+def _init_hw_session(mac: str) -> None:
+    """Ensure all hardware-specific session-state keys exist for this device."""
     import pandas as pd
     defaults = {
-        _HW_JSD_BUF:     [0.0] * 10,
-        _HW_MSE_BUF:     [0.0] * 30,
-        _HW_JSD_PUL_BUF: [0.0] * 30,
-        _HW_PKT_HIS:     pd.DataFrame(columns=["Time", "Pkt Size", "IAT", "Entropy", "Symmetry", "Status"]),
-        _HW_THREAT_LOG:  [],
-        _HW_RE_HIST:     [[0.0] * 20 for _ in range(4)],
-        _HW_MATH_MODE:   False,
+        _HW_JSD_BUF:     {}, # mac -> list
+        _HW_MSE_BUF:     {}, # mac -> list
+        _HW_JSD_PUL_BUF: {}, # mac -> list
+        _HW_PKT_HIS:     {}, # mac -> df
+        _HW_THREAT_LOG:  {}, # mac -> list
+        _HW_RE_HIST:     {}, # mac -> list of lists
     }
     for k, v in defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
+            
+    # Per-device sub-initialization
+    if mac not in st.session_state[_HW_JSD_BUF]:
+        st.session_state[_HW_JSD_BUF][mac] = [0.0] * 10
+    if mac not in st.session_state[_HW_MSE_BUF]:
+        st.session_state[_HW_MSE_BUF][mac] = [0.0] * 30
+    if mac not in st.session_state[_HW_JSD_PUL_BUF]:
+        st.session_state[_HW_JSD_PUL_BUF][mac] = [0.0] * 30
+    if mac not in st.session_state[_HW_PKT_HIS]:
+        st.session_state[_HW_PKT_HIS][mac] = pd.DataFrame(columns=["Time", "Pkt Size", "IAT", "Entropy", "Symmetry", "Status"])
+    if mac not in st.session_state[_HW_THREAT_LOG]:
+        st.session_state[_HW_THREAT_LOG][mac] = []
+    if mac not in st.session_state[_HW_RE_HIST]:
+        st.session_state[_HW_RE_HIST][mac] = [[0.0] * 20 for _ in range(4)]
+    
+    if _HW_MATH_MODE not in st.session_state:
+        st.session_state[_HW_MATH_MODE] = False
 
 
 # ---------------------------------------------------------------------------
@@ -212,6 +228,32 @@ def _render_hw_sidebar(hw_id: str, device_info: dict, mac: str, iface: str) -> N
         if st.button("← Back to Fleet", width="stretch", key="hw_back_fleet"):
             st.session_state.page = "fleet"
             st.rerun()
+
+        st.divider()
+        st.markdown("### 🔴 Record Normal Traffic")
+
+        recording = st.session_state.get("hw_recording", False)
+
+        if not recording:
+            if st.button("⏺ Start Recording", width="stretch", key="start_rec"):
+                st.session_state.hw_recording       = True
+                st.session_state.hw_record_buffer   = []
+                st.session_state.hw_record_start    = datetime.datetime.now()
+                st.rerun()
+        else:
+            elapsed = (datetime.datetime.now() - st.session_state.hw_record_start).seconds
+            st.warning(f"Recording... {elapsed}s elapsed")
+            st.caption("Use your phone normally — browse, stream, etc.")
+
+            if st.button("⏹ Stop & Save", width="stretch", key="stop_rec"):
+                import pandas as pd
+                buf = st.session_state.get("hw_record_buffer", [])
+                if buf:
+                    df = pd.DataFrame(buf, columns=["pkt_size","iat","entropy","symmetry"])
+                    df.to_csv("normal_traffic.csv", index=False)
+                    st.success(f"Saved {len(buf)} samples to normal_traffic.csv")
+                st.session_state.hw_recording = False
+                st.rerun()
 
         # Device info card
         st.markdown(f"""
@@ -282,7 +324,7 @@ def render_hardware_dashboard(autoencoder) -> None:
     iface        = device_info.get("iface", "")
     dev_baseline = device_info["baseline"]
 
-    _init_hw_session()
+    _init_hw_session(mac)
 
     # --- Sidebar ---
     _render_hw_sidebar(hw_id, device_info, mac, iface)
@@ -313,6 +355,11 @@ def render_hardware_dashboard(autoencoder) -> None:
     raw_features = get_features(mac)
     current_features = np.array(raw_features)
 
+    # Append to recording buffer if active
+    if st.session_state.get("hw_recording", False):
+        buf = st.session_state.setdefault("hw_record_buffer", [])
+        buf.append(current_features.tolist())
+
     # ── Top header ────────────────────────────────────────────────────────────
     st.markdown("""
     <div style="background:rgba(0,255,136,0.05);border:1px solid rgba(0,255,136,0.3);
@@ -335,13 +382,13 @@ def render_hardware_dashboard(autoencoder) -> None:
         mse_per_f = torch.mean((tensor_input - output) ** 2, dim=1).squeeze().tolist()
 
     for i in range(4):
-        st.session_state[_HW_RE_HIST][i].append(mse_per_f[i])
-        st.session_state[_HW_RE_HIST][i].pop(0)
+        st.session_state[_HW_RE_HIST][mac][i].append(mse_per_f[i])
+        st.session_state[_HW_RE_HIST][mac][i].pop(0)
 
     jsd = calculate_jsd(current_features, dev_baseline)
     for buf, val in [(_HW_MSE_BUF, mse), (_HW_JSD_PUL_BUF, jsd), (_HW_JSD_BUF, jsd)]:
-        st.session_state[buf].append(val)
-        st.session_state[buf].pop(0)
+        st.session_state[buf][mac].append(val)
+        st.session_state[buf][mac].pop(0)
 
     trust_score = calculate_trust_score(mse, jsd)
     if np.allclose(current_features, dev_baseline, atol=1e-6):
@@ -401,20 +448,20 @@ def render_hardware_dashboard(autoencoder) -> None:
         "Symmetry": round(raw_features[3], 4),
         "Status":   "Safe" if is_safe else "Alert",
     }
-    existing = st.session_state[_HW_PKT_HIS].dropna(axis=1, how="all")
+    existing = st.session_state[_HW_PKT_HIS][mac].dropna(axis=1, how="all")
     new_df   = pd.DataFrame([new_pkt])
-    st.session_state[_HW_PKT_HIS] = pd.concat(
+    st.session_state[_HW_PKT_HIS][mac] = pd.concat(
         [new_df, existing],
         ignore_index=True,
     ).head(12)
     if not is_safe:
-        log = st.session_state[_HW_THREAT_LOG]
+        log = st.session_state[_HW_THREAT_LOG][mac]
         if not log or log[0]["time"] != now_str:
             log.insert(0, {
                 "time": now_str,
                 "msg":  f"Anomalous live traffic! Trust: {trust_score:.1f}%. JSD: {jsd:.3f} MSE: {mse:.4f}",
             })
-            st.session_state[_HW_THREAT_LOG] = log[:20]
+            st.session_state[_HW_THREAT_LOG][mac] = log[:20]
 
     col_gauge, col_stream = st.columns([1, 1.5])
 
@@ -422,7 +469,7 @@ def render_hardware_dashboard(autoencoder) -> None:
         with glass_card(card_class):
             section_header("System Trust Gauge")
             st.plotly_chart(_gauge_chart(trust_score, status_color), width="stretch")
-            st.plotly_chart(_sparkline_chart(st.session_state[_HW_JSD_BUF]), width="stretch")
+            st.plotly_chart(_sparkline_chart(st.session_state[_HW_JSD_BUF][mac]), width="stretch")
             st.markdown(
                 "<div style='text-align:center;font-family:\"Source Code Pro\",monospace;"
                 "font-size:12px;color:#00fff2;text-shadow:0 0 5px #00fff2;margin-top:-10px;'>"
@@ -435,7 +482,7 @@ def render_hardware_dashboard(autoencoder) -> None:
             def _color_status(val):
                 return f'color: {NEON_RED if val == "Alert" else NEON_GREEN}'
             st.dataframe(
-                st.session_state[_HW_PKT_HIS].style.map(_color_status, subset=["Status"]),
+                st.session_state[_HW_PKT_HIS][mac].style.map(_color_status, subset=["Status"]),
                 width="stretch", hide_index=True, height=320,
             )
 
@@ -471,8 +518,8 @@ def render_hardware_dashboard(autoencoder) -> None:
             )
             st.plotly_chart(
                 _pulse_chart(
-                    st.session_state[_HW_MSE_BUF],
-                    st.session_state[_HW_JSD_PUL_BUF],
+                    st.session_state[_HW_MSE_BUF][mac],
+                    st.session_state[_HW_JSD_PUL_BUF][mac],
                 ),
                 width="stretch", config={"displayModeBar": False},
             )
@@ -523,10 +570,11 @@ def render_hardware_dashboard(autoencoder) -> None:
     # ── Threat log ────────────────────────────────────────────────────────────
     with glass_card():
         section_header("Threat Log")
-        if not st.session_state[_HW_THREAT_LOG]:
+        threats = st.session_state[_HW_THREAT_LOG][mac]
+        if not threats:
             st.write("✅ System is secure. No recent threats logged.")
         else:
-            for alert in st.session_state[_HW_THREAT_LOG]:
+            for alert in threats:
                 st.markdown(
                     f'<div style="border-left:4px solid {NEON_RED};padding:8px 12px;'
                     f'margin-bottom:8px;background:rgba(255,0,127,0.08);border-radius:4px;">'

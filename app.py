@@ -69,7 +69,17 @@ if not st.session_state.authenticated:
 # ---------------------------------------------------------------------------
 @st.cache_resource
 def load_aegis_engine():
+    import os
     model = LSTMAutoencoder()
+    weights_path = "aegis_model.pth"
+    if os.path.exists(weights_path):
+        try:
+            model.load_state_dict(torch.load(weights_path, map_location="cpu"))
+            print("[model] Loaded trained weights from aegis_model.pth")
+        except Exception as e:
+            print(f"[model] Could not load weights: {e} — using random weights")
+    else:
+        print("[model] No trained weights found — using random weights")
     model.eval()
     return model
 
@@ -170,10 +180,8 @@ def render_fleet_page():
                 break
         
         if clicked_dev_id:
-            st.session_state.active_device  = clicked_dev_id
-            st.session_state.page           = "dashboard"
-            st.session_state.packet_history = pd.DataFrame(columns=["Time","Pkt Size","IAT","Entropy","Symmetry","Status"])
-            st.session_state.threat_log     = []
+            st.session_state.active_device = clicked_dev_id
+            st.session_state.page          = "dashboard"
             st.rerun()
 
     st.divider()
@@ -254,8 +262,10 @@ def render_fleet_page():
     st.divider()
 
     if st.session_state.remediation_log:
-        st.markdown("### 🛠️ Remediation History")
-        st.dataframe(pd.DataFrame(st.session_state.remediation_log), width="stretch", hide_index=True)
+        flattened_remediation = [item for sublist in st.session_state.remediation_log.values() for item in sublist]
+        if flattened_remediation:
+            st.markdown("### 🛠️ Remediation History")
+            st.dataframe(pd.DataFrame(flattened_remediation).sort_values("Timestamp", ascending=False), width="stretch", hide_index=True)
 
     if st.session_state.audit_logs:
         st.markdown("### 🧾 Audit Trail")

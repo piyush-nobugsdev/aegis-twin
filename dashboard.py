@@ -47,8 +47,8 @@ def _try_send_forensic_report(dev_id, device_info, trust_score, mse, jsd,
                 "trust_score": trust_score, "reconstruction_error": mse,
                 "jsd_value": jsd, "baseline_features": dev_baseline,
                 "current_features": current_features.tolist(),
-                "packet_history": st.session_state.packet_history.to_dict("records"),
-                "threat_log": st.session_state.threat_log,
+                "packet_history": st.session_state.packet_history[dev_id].to_dict("records"),
+                "threat_log": st.session_state.threat_log[dev_id],
             },
         )
         st.success("Forensic report generated and emailed to your account.")
@@ -62,7 +62,7 @@ def _run_remediation(dev_id, device_info):
     now_str     = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     prev_status = st.session_state.device_health.get(dev_id, "Unknown")
 
-    st.session_state.remediation_log.append({
+    st.session_state.remediation_log[dev_id].append({
         "Timestamp": now_str, "Device ID": dev_id,
         "Device Name": device_info["name"], "Sector": device_info["sector"],
         "Action Taken": "Quarantine Lifted & Params Reset",
@@ -77,7 +77,7 @@ def _run_remediation(dev_id, device_info):
         time.sleep(0.8)
         st.session_state.device_health[dev_id] = "Healthy"
         st.session_state.remediation_reset      = dev_id
-        st.session_state.threat_log             = []
+        st.session_state.threat_log[dev_id]     = []
         st.write("Flushing network buffers...")
         time.sleep(0.7)
         st.write("Re-synchronizing digital twin...")
@@ -196,7 +196,7 @@ def render_device_dashboard(autoencoder):
         for key, i in [("pkt", 0), ("iat", 1), ("ent", 2), ("sym", 3)]:
             st.session_state[f"{key}_{dev_id}"] = float(dev_baseline[i])
         st.session_state.attack_step[dev_id] = 0
-        st.session_state.threat_log          = []
+        st.session_state.threat_log[dev_id]  = []
         st.session_state.remediation_locked  = False
         del st.session_state["remediation_reset"]
 
@@ -205,9 +205,48 @@ def render_device_dashboard(autoencoder):
         for k, v in st.session_state.pop("attack_values", {}).items():
             st.session_state[k] = v
 
+    # --- Per-Device Session State Initialization ---
+    if dev_id not in st.session_state.trust_scores:
+        st.session_state.trust_scores[dev_id] = 100.0
+    if dev_id not in st.session_state.device_health:
+        st.session_state.device_health[dev_id] = "Healthy"
+    if dev_id not in st.session_state.threat_log:
+        st.session_state.threat_log[dev_id] = []
+    import pandas as pd
+    if dev_id not in st.session_state.packet_history:
+        st.session_state.packet_history[dev_id] = pd.DataFrame(
+            columns=["Time", "Pkt Size", "IAT", "Entropy", "Symmetry", "Status"])
+    if dev_id not in st.session_state.attack_step:
+        st.session_state.attack_step[dev_id] = 0
+    if dev_id not in st.session_state.remediation_log:
+        st.session_state.remediation_log[dev_id] = []
+    
+    # Histories for charts
+    if dev_id not in st.session_state.jsd_history:
+        st.session_state.jsd_history[dev_id] = [0.0] * 10
+    if dev_id not in st.session_state.pulse_mse_history:
+        st.session_state.pulse_mse_history[dev_id] = [0.0] * 30
+    if dev_id not in st.session_state.pulse_jsd_history:
+        st.session_state.pulse_jsd_history[dev_id] = [0.0] * 30
+    if dev_id not in st.session_state.reconstruction_errors_history:
+        st.session_state.reconstruction_errors_history[dev_id] = [[0.0] * 20 for _ in range(4)]
+
     for key, i in [("pkt", 0), ("iat", 1), ("ent", 2), ("sym", 3)]:
         st.session_state.setdefault(f"{key}_{dev_id}", float(dev_baseline[i]))
     st.session_state.attack_step.setdefault(dev_id, 0)
+
+    # Initialize per-device health only if this device has never been seen
+    if dev_id not in st.session_state.device_health:
+        st.session_state.device_health[dev_id] = "Healthy"
+
+    # Initialize packet history and threat log only if absent
+    import pandas as pd
+    if "packet_history" not in st.session_state:
+        st.session_state.packet_history = pd.DataFrame(
+            columns=["Time", "Pkt Size", "IAT", "Entropy", "Symmetry", "Status"]
+        )
+    if "threat_log" not in st.session_state:
+        st.session_state.threat_log = []
 
     # --- Sidebar ---
     _render_sidebar(dev_id, device_info, dev_baseline, disabled)
@@ -230,15 +269,16 @@ def render_device_dashboard(autoencoder):
         mse_per_f = torch.mean((tensor_input - output) ** 2, dim=1).squeeze().tolist()
 
     for i in range(4):
-        st.session_state.reconstruction_errors_history[i].append(mse_per_f[i])
-        st.session_state.reconstruction_errors_history[i].pop(0)
+        st.session_state.reconstruction_errors_history[dev_id][i].append(mse_per_f[i])
+        st.session_state.reconstruction_errors_history[dev_id][i].pop(0)
 
     jsd = calculate_jsd(current_features, dev_baseline)
     for buf, val in [("pulse_mse_history", mse), ("pulse_jsd_history", jsd), ("jsd_history", jsd)]:
-        st.session_state[buf].append(val)
-        st.session_state[buf].pop(0)
+        st.session_state[buf][dev_id].append(val)
+        st.session_state[buf][dev_id].pop(0)
 
     trust_score = calculate_trust_score(mse, jsd)
+    st.session_state.trust_scores[dev_id] = trust_score
     if np.allclose(current_features, dev_baseline, atol=1e-8):
         mse, trust_score = 0.0, 100.0
 
@@ -296,17 +336,18 @@ def render_device_dashboard(autoencoder):
             "Status":   "Safe" if is_safe else "Alert",
         }
         import pandas as pd
-        st.session_state.packet_history = pd.concat(
-            [pd.DataFrame([new_pkt]), st.session_state.packet_history], ignore_index=True,
+        st.session_state.packet_history[dev_id] = pd.concat(
+            [pd.DataFrame([new_pkt]), st.session_state.packet_history[dev_id]], ignore_index=True,
         ).head(12)
 
         if not is_safe:
-            if not st.session_state.threat_log or st.session_state.threat_log[0]["time"] != now_str:
-                st.session_state.threat_log.insert(0, {
+            threats = st.session_state.threat_log[dev_id]
+            if not threats or threats[0]["time"] != now_str:
+                threats.insert(0, {
                     "time": now_str,
-                    "msg":  f"Anomalous flow detected! Trust dropped to {trust_score}%. MSE: {mse:.3f}",
+                    "msg":  f"Anomalous flow detected! Trust dropped to {trust_score:.1f}%. MSE: {mse:.3f}",
                 })
-                st.session_state.threat_log = st.session_state.threat_log[:20]
+                st.session_state.threat_log[dev_id] = threats[:20]
 
     # --- Top row: Gauge | Packet Stream ---
     col_gauge, col_stream = st.columns([1, 1.5])
@@ -315,7 +356,7 @@ def render_device_dashboard(autoencoder):
         with glass_card(card_class):
             section_header("System Trust Gauge")
             st.plotly_chart(_gauge_chart(trust_score, status_color), width="stretch")
-            st.plotly_chart(_sparkline_chart(st.session_state.jsd_history), width="stretch")
+            st.plotly_chart(_sparkline_chart(st.session_state.jsd_history[dev_id]), width="stretch")
             st.markdown(
                 "<div style='text-align:center;font-family:\"Source Code Pro\",monospace;"
                 "font-size:12px;color:#00fff2;text-shadow:0 0 5px #00fff2;margin-top:-10px;'>"
@@ -328,7 +369,7 @@ def render_device_dashboard(autoencoder):
             def _color_status(val):
                 return f'color: {NEON_RED if val == "Alert" else NEON_GREEN}'
             st.dataframe(
-                st.session_state.packet_history.style.map(_color_status, subset=["Status"]),
+                st.session_state.packet_history[dev_id].style.map(_color_status, subset=["Status"]),
                 width="stretch", hide_index=True, height=320,
             )
 
@@ -364,7 +405,7 @@ def render_device_dashboard(autoencoder):
                     "Neural Health Monitor (Live Pulse)</div>", unsafe_allow_html=True,
                 )
                 st.plotly_chart(
-                    _pulse_chart(st.session_state.pulse_mse_history, st.session_state.pulse_jsd_history),
+                    _pulse_chart(st.session_state.pulse_mse_history[dev_id], st.session_state.pulse_jsd_history[dev_id]),
                     width="stretch", config={"displayModeBar": False},
                 )
 
@@ -407,10 +448,11 @@ def render_device_dashboard(autoencoder):
     with st.container():
         with glass_card():
             section_header("Threat Log")
-            if not st.session_state.threat_log:
+            threats = st.session_state.threat_log[dev_id]
+            if not threats:
                 st.write("✅ System is secure. No recent threats logged.")
             else:
-                for alert in st.session_state.threat_log:
+                for alert in threats:
                     st.markdown(
                         f'<div style="border-left:4px solid {NEON_RED};padding:8px 12px;'
                         f'margin-bottom:8px;background:rgba(255,0,127,0.08);border-radius:4px;">'
@@ -503,9 +545,9 @@ def _render_sidebar(dev_id, device_info, dev_baseline, disabled):
         if st.button("Clear View Log", width="stretch",
                      key=f"clear_{dev_id}", disabled=disabled):
             import pandas as pd
-            st.session_state.packet_history = pd.DataFrame(
+            st.session_state.packet_history[dev_id] = pd.DataFrame(
                 columns=["Time", "Pkt Size", "IAT", "Entropy", "Symmetry", "Status"])
-            st.session_state.threat_log = []
+            st.session_state.threat_log[dev_id] = []
             st.rerun()
 
 
