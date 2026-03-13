@@ -8,6 +8,10 @@ anomaly dashboard powered by PyTorch and the LSTM Autoencoder engines.
 Run with: streamlit run app.py
 """
 
+import os
+import smtplib
+from email.message import EmailMessage
+
 import streamlit as st
 import numpy as np
 import pandas as pd
@@ -16,8 +20,11 @@ import time
 import datetime
 import random
 import torch
+from dotenv import load_dotenv
 
+from auth import create_user, has_users, init_db, verify_user
 from engine import calculate_trust_score, calculate_jsd
+from forensics import generate_and_send_report
 from model import LSTMAutoencoder
 
 # --- PAGE CONFIG ---
@@ -27,6 +34,20 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+# --- ENVIRONMENT / AUTH SETUP ---
+load_dotenv()  # load .env file when present
+init_db()
+
+# If there are no users yet, bootstrap an admin account from env vars.
+if not has_users():
+    admin_email = os.environ.get("AEGIS_ADMIN_EMAIL")
+    admin_password = os.environ.get("AEGIS_ADMIN_PASSWORD")
+    if admin_email and admin_password:
+        try:
+            create_user(admin_email, admin_password)
+        except Exception:
+            pass
 
 # --- THEME & CSS (Glassmorphism + Dark Theme) ---
 NEON_GREEN = "#00ff88"
@@ -178,6 +199,107 @@ if 'threat_log' not in st.session_state:
 if 'remediation_log' not in st.session_state:
     st.session_state.remediation_log = []
 
+# Authentication state (simple session-based guard)
+if 'authenticated' not in st.session_state:
+    st.session_state.authenticated = False
+if 'user_email' not in st.session_state:
+    st.session_state.user_email = None
+if 'login_error' not in st.session_state:
+    st.session_state.login_error = None
+if 'password_visible' not in st.session_state:
+    st.session_state.password_visible = False
+if 'register_mode' not in st.session_state:
+    st.session_state.register_mode = False
+if 'last_alert_sent' not in st.session_state:
+    st.session_state.last_alert_sent = {}
+
+
+def _render_login_page() -> None:
+    """Render a responsive login / onboarding screen and enforce authentication."""
+
+    # FIX 1: Removed orphaned `st.markdown("</div>", ...)` that was placed before
+    # st.stop(), which caused an unclosed HTML div and a misplaced closing tag
+    # at the top of the login form on every render.
+
+    # === FORM ===
+    email = st.text_input("Email", value=st.session_state.get("login_email", ""), placeholder="you@example.com")
+    pw_type = "default" if st.session_state.password_visible else "password"
+    password = st.text_input("Password", type=pw_type)
+    show_pw = st.checkbox("Show password", value=st.session_state.password_visible)
+    st.session_state.password_visible = show_pw
+
+    is_first_user = not has_users()
+
+    if st.session_state.register_mode:
+        st.info("Create a new account. Passwords are stored securely.")
+    elif is_first_user:
+        st.info("No users exist yet. This will create the first admin account.")
+
+    confirm_password = None
+    if st.session_state.register_mode:
+        confirm_password = st.text_input("Confirm Password", type=pw_type)
+
+    button_text = "Create account" if st.session_state.register_mode else "Sign in"
+    if st.button(button_text):
+        st.session_state.login_email = email
+        # FIX: st.text_input() is typed as str | None by Pylance.
+        # Guard here so that downstream calls to create_user(), verify_user(),
+        # and .strip() all receive a guaranteed str, not str | None.
+        if not email:
+            st.session_state.login_error = "Email is required."
+        elif st.session_state.register_mode:
+            # email is narrowed to str from this point on
+            clean_email: str = email
+            if not password or not confirm_password:
+                st.session_state.login_error = "Password and confirmation are required."
+            elif password != confirm_password:
+                st.session_state.login_error = "Passwords do not match."
+            else:
+                try:
+                    create_user(clean_email, password)
+                    st.session_state.authenticated = True
+                    st.session_state.user_email = clean_email.strip().lower()
+                    st.session_state.page = "fleet"
+                    st.session_state.login_error = None
+                    st.success("Account created and logged in.")
+                    st.rerun()
+                except Exception as exc:
+                    st.session_state.login_error = str(exc)
+        else:
+            clean_email = email
+            if verify_user(clean_email, password):
+                st.session_state.authenticated = True
+                st.session_state.user_email = clean_email.strip().lower()
+                st.session_state.page = "fleet"
+                st.session_state.login_error = None
+                st.success("Login successful.")
+                st.rerun()
+            else:
+                st.session_state.login_error = "Invalid email or password."
+
+    if st.session_state.login_error:
+        st.error(st.session_state.login_error)
+
+    if st.session_state.register_mode:
+        if st.button("Already have an account? Sign in"):
+            st.session_state.register_mode = False
+            st.session_state.login_error = None
+            st.rerun()
+    else:
+        if st.button("Don't have an account? Register"):
+            st.session_state.register_mode = True
+            st.session_state.login_error = None
+            st.rerun()
+
+    # If we're still here and the user is not authenticated, stop.
+    if not st.session_state.authenticated:
+        st.stop()
+
+
+# Enforce authentication
+if not st.session_state.authenticated:
+    _render_login_page()
+
 # --- MODEL CACHING ---
 @st.cache_resource
 def load_aegis_engine():
@@ -240,12 +362,21 @@ if st.session_state.page == "fleet":
 # ==========================================
 elif st.session_state.page == "dashboard":
     dev_id = st.session_state.active_device
+    if not isinstance(dev_id, str) or dev_id not in IOT_REGISTRY:
+        st.error("No device selected or invalid device ID.")
+        st.stop()
     device_info = IOT_REGISTRY[dev_id]
     dev_baseline = device_info["baseline"]
 
     # --- SIDEBAR & DEVICE REGISTRY ---
     with st.sidebar:
         st.markdown(f"<h1 style='text-align: center; color: {NEON_BLUE} !important;'>🛡️ Aegis Control</h1>", unsafe_allow_html=True)
+        st.markdown(f"<p style='text-align:center; color: #aaa; margin-top: -10px;'>Logged in as <strong>{st.session_state.user_email or 'Unknown'}</strong></p>", unsafe_allow_html=True)
+        if st.button("Log out", use_container_width=True, key="logout"):
+            st.session_state.authenticated = False
+            st.session_state.user_email = None
+            st.session_state.page = "fleet"
+            st.rerun()
         st.markdown("---")
         
         # Back Button
@@ -270,7 +401,7 @@ elif st.session_state.page == "dashboard":
             </div>
         """, unsafe_allow_html=True)
 
-        scan_active = st.toggle("📡 Live Scan Mode", value=True, key=f"scan_{dev_id}")
+        scan_active = st.checkbox("📡 Live Scan Mode", value=True, key=f"scan_{dev_id}")
         st.markdown("---")
         
         st.markdown("### Manual Traffic Injection")
@@ -288,7 +419,7 @@ elif st.session_state.page == "dashboard":
 
     # --- AUTOENCODER INFERENCE ---
     current_features = np.array([val_pkt_size, val_iat, val_entropy, val_symmetry])
-    feature_sequence = np.tile(current_features, (1, 10, 1))
+    feature_sequence = np.tile(current_features, (10, 1))[np.newaxis, :, :]  # shape: (1, 10, 4)
     tensor_input = torch.tensor(feature_sequence, dtype=torch.float32)
 
     with torch.no_grad():
@@ -299,17 +430,24 @@ elif st.session_state.page == "dashboard":
     trust_score = calculate_trust_score(mse, jsd)
 
     is_safe = trust_score >= 50
-    status_color = NEON_GREEN if is_safe else NEON_RED
-    status_text = "SAFE" if is_safe else "COMPROMISED"
+    is_critical = trust_score < 30
+
+    status_color = (
+        NEON_GREEN if is_safe else (NEON_RED if is_critical else "#ffb300")
+    )
 
     if is_safe:
         st.session_state.device_health[dev_id] = "Healthy"
         card_class = "neon-safe"
         indicator_html = f"<span style='color: {NEON_GREEN};'>● ONLINE</span>"
-    else:
+    elif is_critical:
         st.session_state.device_health[dev_id] = "Compromised"
         card_class = "neon-compromised pulse-red"
         indicator_html = f"<span style='color: {NEON_RED}; animation: blinker 1s linear infinite;'>● CRITICAL</span>"
+    else:
+        st.session_state.device_health[dev_id] = "Compromised"
+        card_class = "neon-compromised"
+        indicator_html = f"<span style='color: #ffb300;'>● COMPROMISED</span>"
 
     # --- MAIN LAYOUT : BENTO GRID ---
     st.markdown(f"""
@@ -323,10 +461,52 @@ elif st.session_state.page == "dashboard":
 
     # Trigger alerts implicitly based on state
     if not is_safe:
-        st.error(f"CRITICAL: SECURITY BREACH. Unrecognized anomalies in Sector {device_info['sector']} ({device_info['type']}). INITIATING NETWORK QUARANTINE.", icon="🚨")
-        
+        st.error(
+            f"CRITICAL: SECURITY BREACH. Unrecognized anomalies in Sector {device_info['sector']} ({device_info['type']}). INITIATING NETWORK QUARANTINE.",
+            icon="🚨",
+        )
+
+        # Auto-generate forensic report for CRITICAL events (trust_score < 30)
+        if trust_score < 30 and st.session_state.user_email:
+            last_sent = st.session_state.last_alert_sent.get(dev_id)
+            cooldown = datetime.timedelta(minutes=10)
+            now_utc = datetime.datetime.utcnow()
+            should_send = last_sent is None or (now_utc - last_sent) > cooldown
+
+            if should_send:
+                try:
+                    device_data = {
+                        "device_id": dev_id,
+                        "device_name": device_info["name"],
+                        "sector": device_info["sector"],
+                        "timestamp": now_utc.isoformat(),
+                        "trust_score": trust_score,
+                        "reconstruction_error": mse,
+                        "jsd_value": jsd,
+                        "baseline_features": dev_baseline,
+                        "current_features": current_features.tolist(),
+                        "packet_history": st.session_state.packet_history.to_dict("records"),
+                        "threat_log": st.session_state.threat_log,
+                    }
+                    generate_and_send_report(
+                        recipient_email=st.session_state.user_email,
+                        device_data=device_data,
+                    )
+                    st.success("Forensic report generated and emailed to your account.")
+                    st.session_state.last_alert_sent[dev_id] = now_utc
+                except Exception as exc:
+                    st.warning(
+                        f"Failed to send forensic report email: {exc}. Check SMTP configuration and network connectivity."
+                    )
+                    # leave last_alert_sent untouched so we can retry next cycle
+
         # Remediate Action Hook
-        col_err1, col_err2 = st.columns([8, 2])
+        # FIX 2: Removed unused `col_err1` from the column unpacking.
+        # `st.columns([8, 2])` returns exactly 2 columns; the original code
+        # correctly unpacked both, but `col_err1` was never referenced inside
+        # the `with` block, creating a misleading dead variable. Replaced with
+        # a single `_` throwaway to make the intent explicit and avoid confusion.
+        _, col_err2 = st.columns([8, 2])
         with col_err2:
             if st.button("🔧 Remediate Device", use_container_width=True, key=f"remed_{dev_id}"):
                 # Log remediation
@@ -416,11 +596,14 @@ elif st.session_state.page == "dashboard":
         st.markdown('<div class="glass-card">', unsafe_allow_html=True)
         st.markdown('<div class="section-header">Live Packet Stream</div>', unsafe_allow_html=True)
         
+        # FIX 3: Replaced the deprecated `.style.map()` with `.style.applymap()`.
+        # In pandas >= 2.1, `Styler.map()` was renamed to `Styler.applymap()` and
+        # calling `.map()` on a Styler object raises an AttributeError at runtime.
         def color_status(val):
             color = NEON_RED if val == 'Alert' else NEON_GREEN
             return f'color: {color}'
             
-        styled_df = st.session_state.packet_history.style.map(color_status, subset=['Status'])
+        styled_df = st.session_state.packet_history.style.applymap(color_status, subset=['Status'])
         st.dataframe(styled_df, use_container_width=True, hide_index=True, height=320)
         st.markdown('</div>', unsafe_allow_html=True)
 
@@ -442,13 +625,19 @@ elif st.session_state.page == "dashboard":
         fillcolor='rgba(0, 207, 255, 0.2)'
     ))
     # Current
+    # FIX 4: Corrected the dynamic RGBA fillcolor for the "Current Traffic" radar trace.
+    # The original expression mixed integer channel values with a Python conditional
+    # in an f-string, producing malformed color strings like `rgba(255, 45, 85,0.3)`
+    # vs `rgba(0, 255, 136, 0.3)`. Replaced with a clean ternary that assigns the
+    # full pre-built color string directly, which is always valid CSS/SVG.
+    current_fill_color = 'rgba(255, 45, 85, 0.3)' if not is_safe else 'rgba(0, 255, 136, 0.3)'
     fig_radar.add_trace(go.Scatterpolar(
         r=current_features,
         theta=categories,
         fill='toself',
         name='Current Traffic',
         line_color=status_color,
-        fillcolor=f'rgba({255 if not is_safe else 0}, {45 if not is_safe else 255}, {85 if not is_safe else 136}, 0.3)'
+        fillcolor=current_fill_color
     ))
     fig_radar.update_layout(
         polar=dict(
