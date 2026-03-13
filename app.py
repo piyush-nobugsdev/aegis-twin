@@ -124,6 +124,12 @@ st.markdown(f"""
         color: #00ff88 !important;
     }}
 
+    /* Attack button red styling */
+    div.stButton > button[kind="attack"] {{
+        border: 1px solid #ff2d55 !important;
+        color: #ff2d55 !important;
+    }}
+
     .section-header {{
         font-size: 1.1rem;
         font-weight: 600;
@@ -146,6 +152,17 @@ st.markdown(f"""
     /* Table Styling */
     .stDataFrame {{
         background: transparent !important;
+    }}
+
+    /* Attack progress bar */
+    .attack-progress {{
+        background: rgba(255, 45, 85, 0.15);
+        border: 1px solid rgba(255, 45, 85, 0.4);
+        border-radius: 8px;
+        padding: 10px 12px;
+        margin-top: 8px;
+        font-size: 0.85em;
+        color: #ff2d55;
     }}
 </style>
 """, unsafe_allow_html=True)
@@ -177,12 +194,19 @@ if 'threat_log' not in st.session_state:
     st.session_state.threat_log = []
 if 'remediation_log' not in st.session_state:
     st.session_state.remediation_log = []
+if 'audit_logs' not in st.session_state:
+    st.session_state.audit_logs = []
+if 'remediation_locked' not in st.session_state:
+    st.session_state.remediation_locked = False
+# Attack step counter — tracks how far the progressive attack has advanced
+if 'attack_step' not in st.session_state:
+    st.session_state.attack_step = {}
 
 # --- MODEL CACHING ---
 @st.cache_resource
 def load_aegis_engine():
     model = LSTMAutoencoder()
-    model.eval()  # ensure inference mode
+    model.eval()
     return model
 
 autoencoder = load_aegis_engine()
@@ -197,6 +221,40 @@ def navigate_to_fleet():
     st.session_state.active_device = None
     st.session_state.page = "fleet"
 
+def advance_attack(dev_id, dev_baseline, staged: dict):
+    """
+    Compute one attack step and write results into `staged` (a plain dict).
+    Values are read from `staged` first (so sequential steps in the same
+    button-press accumulate correctly), then from session_state as fallback.
+    Nothing is written to session_state here — that happens in the deferred
+    block at the top of the render cycle, BEFORE widgets are instantiated.
+    """
+    step = st.session_state.attack_step.get(dev_id, 0)
+
+    base_delta = 0.12 + step * 0.08
+    jitter     = random.uniform(0.0, 0.06)
+    delta      = min(base_delta + jitter, 0.40)
+
+    keys = [
+        (f"pkt_{dev_id}", 0),
+        (f"iat_{dev_id}", 1),
+        (f"ent_{dev_id}", 2),
+        (f"sym_{dev_id}", 3),
+    ]
+
+    for state_key, idx in keys:
+        # Read from staged dict first so steps accumulate within one click
+        current = staged.get(state_key,
+                  st.session_state.get(state_key, float(dev_baseline[idx])))
+        if dev_baseline[idx] < 0.5:
+            new_val = current + delta
+        else:
+            new_val = current - delta
+        staged[state_key] = float(np.clip(new_val, 0.0, 1.0))
+
+    st.session_state.attack_step[dev_id] = min(step + 1, 5)
+
+
 # ==========================================
 # PAGE 1: FLEET OVERVIEW
 # ==========================================
@@ -205,7 +263,6 @@ if st.session_state.page == "fleet":
     st.markdown("<p style='text-align: center; color: #aaa;'>Select a registered IoT device to enter its continuous monitoring Digital Twin dashboard.</p>", unsafe_allow_html=True)
     st.markdown("---")
     
-    # Create a 4-column grid
     cols = st.columns(4)
     for idx, (dev_id, info) in enumerate(IOT_REGISTRY.items()):
         col = cols[idx % 4]
@@ -224,7 +281,7 @@ if st.session_state.page == "fleet":
                 <div style="color: {h_color}; font-weight: bold; margin-bottom: 10px; animation: {h_anim};">{h_text}</div>
             </div>
             """, unsafe_allow_html=True)
-            if st.button(f"View Digital Twin", key=f"btn_{dev_id}", use_container_width=True):
+            if st.button(f"View Digital Twin", key=f"btn_{dev_id}", width="stretch"):
                 navigate_to_dashboard(dev_id)
                 st.rerun()
                 
@@ -232,7 +289,12 @@ if st.session_state.page == "fleet":
     if st.session_state.remediation_log:
         st.markdown("### 🛠️ Remediation History")
         df_remedy = pd.DataFrame(st.session_state.remediation_log)
-        st.dataframe(df_remedy, use_container_width=True, hide_index=True)
+        st.dataframe(df_remedy, width="stretch", hide_index=True)
+
+    if st.session_state.audit_logs:
+        st.markdown("### 🧾 Audit Trail")
+        df_audit = pd.DataFrame(st.session_state.audit_logs)
+        st.dataframe(df_audit, width="stretch", hide_index=True)
 
 
 # ==========================================
@@ -243,13 +305,44 @@ elif st.session_state.page == "dashboard":
     device_info = IOT_REGISTRY[dev_id]
     dev_baseline = device_info["baseline"]
 
-    # --- SIDEBAR & DEVICE REGISTRY ---
+    disabled = st.session_state.remediation_locked
+
+    # --- Deferred state updates (MUST run before any widget is instantiated) ---
+
+    # Remediation reset: restore all sliders to baseline and clear attack step
+    if st.session_state.get("remediation_reset") == dev_id:
+        st.session_state[f"pkt_{dev_id}"] = float(dev_baseline[0])
+        st.session_state[f"iat_{dev_id}"] = float(dev_baseline[1])
+        st.session_state[f"ent_{dev_id}"] = float(dev_baseline[2])
+        st.session_state[f"sym_{dev_id}"] = float(dev_baseline[3])
+        st.session_state.attack_step[dev_id] = 0
+        st.session_state.threat_log = []
+        st.session_state.remediation_locked = False
+        del st.session_state["remediation_reset"]
+
+    # Attack trigger: apply pre-computed values BEFORE sliders are created
+    if st.session_state.get("attack_trigger") == dev_id:
+        pending = st.session_state.pop("attack_trigger")          # consume flag
+        computed = st.session_state.pop("attack_values", {})      # consume values
+        for k, v in computed.items():
+            st.session_state[k] = v
+
+    # Ensure slider keys exist before widgets are created
+    for key, idx in [("pkt", 0), ("iat", 1), ("ent", 2), ("sym", 3)]:
+        state_key = f"{key}_{dev_id}"
+        if state_key not in st.session_state:
+            st.session_state[state_key] = float(dev_baseline[idx])
+
+    # Initialise attack step counter for this device
+    if dev_id not in st.session_state.attack_step:
+        st.session_state.attack_step[dev_id] = 0
+
+    # --- SIDEBAR ---
     with st.sidebar:
         st.markdown(f"<h1 style='text-align: center; color: {NEON_BLUE} !important;'>🛡️ Aegis Control</h1>", unsafe_allow_html=True)
         st.markdown("---")
         
-        # Back Button
-        if st.button("← Back to Fleet", use_container_width=True):
+        if st.button("← Back to Fleet", width="stretch", disabled=disabled):
             navigate_to_fleet()
             st.rerun()
             
@@ -270,18 +363,65 @@ elif st.session_state.page == "dashboard":
             </div>
         """, unsafe_allow_html=True)
 
-        scan_active = st.toggle("📡 Live Scan Mode", value=True, key=f"scan_{dev_id}")
+        scan_active = st.toggle("📡 Live Scan Mode", value=True, key=f"scan_{dev_id}", disabled=disabled)
         st.markdown("---")
         
         st.markdown("### Manual Traffic Injection")
-        # Initialize sliders around baseline
-        val_pkt_size = st.slider("Packet Size (Norm)", 0.0, 1.0, float(dev_baseline[0]), key=f"pkt_{dev_id}")
-        val_iat = st.slider("Inter-Arrival Time (Norm)", 0.0, 1.0, float(dev_baseline[1]), key=f"iat_{dev_id}")
-        val_entropy = st.slider("Entropy (Norm)", 0.0, 1.0, float(dev_baseline[2]), key=f"ent_{dev_id}")
-        val_symmetry = st.slider("Symmetry (Norm)", 0.0, 1.0, float(dev_baseline[3]), key=f"sym_{dev_id}")
+        val_pkt_size = st.slider("Packet Size (Norm)", 0.0, 1.0, value=st.session_state[f"pkt_{dev_id}"], key=f"pkt_{dev_id}", disabled=disabled)
+        val_iat      = st.slider("Inter-Arrival Time (Norm)", 0.0, 1.0, value=st.session_state[f"iat_{dev_id}"], key=f"iat_{dev_id}", disabled=disabled)
+        val_entropy  = st.slider("Entropy (Norm)", 0.0, 1.0, value=st.session_state[f"ent_{dev_id}"], key=f"ent_{dev_id}", disabled=disabled)
+        val_symmetry = st.slider("Symmetry (Norm)", 0.0, 1.0, value=st.session_state[f"sym_{dev_id}"], key=f"sym_{dev_id}", disabled=disabled)
+
+        # ── ATTACK BUTTON (always visible, placed directly below sliders) ──────
+        st.markdown("---")
+
+        attack_step_now = st.session_state.attack_step.get(dev_id, 0)
+
+        # Show a mini progress indicator so the user can see how far the attack has gone
+        if attack_step_now > 0:
+            bar_pct  = min(attack_step_now / 5, 1.0)
+            bar_fill = int(bar_pct * 10)
+            bar_str  = "█" * bar_fill + "░" * (10 - bar_fill)
+            severity_labels = ["", "LOW", "MODERATE", "HIGH", "SEVERE", "CRITICAL"]
+            severity = severity_labels[min(attack_step_now, 5)]
+            st.markdown(f"""
+            <div class="attack-progress">
+                ⚠️ Attack in progress — {severity}<br>
+                <span style="font-family: monospace; letter-spacing: 2px;">{bar_str}</span>
+                &nbsp;Step {attack_step_now}/5
+            </div>
+            """, unsafe_allow_html=True)
+
+        if st.button("🚨 Launch Attack", width="stretch", key=f"attack_{dev_id}", disabled=disabled):
+            staged = {}   # values computed here, applied next render cycle
+            with st.status("⚠️ Simulating cyber attack...", expanded=True) as attack_status:
+                messages = [
+                    "Probing network interfaces...",
+                    "Injecting malicious traffic packets...",
+                    "Escalating privilege — overloading device buffers...",
+                    "Corrupting telemetry stream...",
+                    "Bypassing anomaly thresholds...",
+                ]
+                steps_this_click = 3
+
+                for i in range(steps_this_click):
+                    st.write(messages[min(i, len(messages) - 1)])
+                    advance_attack(dev_id, dev_baseline, staged)   # ← accumulate into staged
+                    time.sleep(0.6)
+
+                attack_status.update(label="💀 Attack payload delivered", state="error")
+                time.sleep(0.4)
+
+            # Store staged values + trigger flag; deferred block applies them
+            # at the TOP of the next render, before any widget is instantiated.
+            st.session_state["attack_values"]  = staged
+            st.session_state["attack_trigger"] = dev_id
+            st.rerun()
+
+        # ─────────────────────────────────────────────────────────────────────────
 
         st.markdown("---")
-        if st.button("Clear View Log", use_container_width=True, key=f"clear_{dev_id}"):
+        if st.button("Clear View Log", width="stretch", key=f"clear_{dev_id}", disabled=disabled):
             st.session_state.packet_history = pd.DataFrame(columns=["Time", "Pkt Size", "IAT", "Entropy", "Symmetry", "Status"])
             st.session_state.threat_log = []
             st.rerun()
@@ -298,6 +438,10 @@ elif st.session_state.page == "dashboard":
     jsd = calculate_jsd(current_features, dev_baseline)
     trust_score = calculate_trust_score(mse, jsd)
 
+    if np.allclose(current_features, dev_baseline, atol=1e-8):
+        mse = 0.0
+        trust_score = 100.0
+
     is_safe = trust_score >= 50
     status_color = NEON_GREEN if is_safe else NEON_RED
     status_text = "SAFE" if is_safe else "COMPROMISED"
@@ -311,7 +455,7 @@ elif st.session_state.page == "dashboard":
         card_class = "neon-compromised pulse-red"
         indicator_html = f"<span style='color: {NEON_RED}; animation: blinker 1s linear infinite;'>● CRITICAL</span>"
 
-    # --- MAIN LAYOUT : BENTO GRID ---
+    # --- MAIN LAYOUT ---
     st.markdown(f"""
     <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom: 20px;">
         <h1 style="margin:0;">{device_info['icon']} Twin Dashboard: {device_info['name']}</h1>
@@ -321,34 +465,44 @@ elif st.session_state.page == "dashboard":
     </div>
     """, unsafe_allow_html=True)
 
-    # Trigger alerts implicitly based on state
+    # Critical alert banner + Remediate button (only when CRITICAL)
     if not is_safe:
         st.error(f"CRITICAL: SECURITY BREACH. Unrecognized anomalies in Sector {device_info['sector']} ({device_info['type']}). INITIATING NETWORK QUARANTINE.", icon="🚨")
         
-        # Remediate Action Hook
         col_err1, col_err2 = st.columns([8, 2])
         with col_err2:
-            if st.button("🔧 Remediate Device", use_container_width=True, key=f"remed_{dev_id}"):
-                # Log remediation
-                now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                st.session_state.remediation_log.append({
-                    "Timestamp": now_str,
-                    "Device ID": dev_id,
-                    "Device Name": device_info['name'],
-                    "Sector": device_info['sector'],
-                    "Action Taken": "Quarantine Lifted & Params Reset"
+            if st.button("🔧 Remediate Device", width="stretch", key=f"remed_{dev_id}", disabled=disabled):
+                st.session_state.remediation_locked = True
+
+                prev_status = st.session_state.device_health.get(dev_id, "Unknown")
+                now = datetime.datetime.now()
+
+                st.session_state.audit_logs.insert(0, {
+                    "device": dev_id,
+                    "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
+                    "event": "Remediation Success",
+                    "previous_status": prev_status,
                 })
-                # Heal the device globally
-                st.session_state.device_health[dev_id] = "Healthy"
-                # Reset sliders natively
-                st.session_state[f"pkt_{dev_id}"] = float(dev_baseline[0])
-                st.session_state[f"iat_{dev_id}"] = float(dev_baseline[1])
-                st.session_state[f"ent_{dev_id}"] = float(dev_baseline[2])
-                st.session_state[f"sym_{dev_id}"] = float(dev_baseline[3])
-                
-                st.session_state.threat_log = []
-                st.success("Remediation Complete.")
-                time.sleep(1.0)
+
+                with st.status("Running remediation protocol...", expanded=True) as remed_status:
+                    st.write("Resetting device parameters...")
+                    time.sleep(0.8)
+
+                    st.session_state.device_health[dev_id] = "Healthy"
+                    st.session_state.remediation_reset = dev_id
+                    st.session_state.threat_log = []
+
+                    st.write("Flushing network buffers...")
+                    time.sleep(0.7)
+
+                    st.write("Re-synchronizing digital twin...")
+                    time.sleep(0.7)
+
+                    remed_status.update(label="✅ Device restored to safe baseline", state="complete")
+                    time.sleep(0.4)
+
+                    st.session_state.remediation_locked = False
+
                 st.rerun()
 
     now_str = datetime.datetime.now().strftime("%H:%M:%S")
@@ -366,8 +520,6 @@ elif st.session_state.page == "dashboard":
         st.session_state.packet_history = pd.concat([df_new, st.session_state.packet_history], ignore_index=True).head(12)
 
         if not is_safe:
-            # Check if this precise second was logged to avoid massive duplicates 
-            # (though with sleep it's less an issue)
             if not st.session_state.threat_log or st.session_state.threat_log[0]["time"] != now_str:
                 st.session_state.threat_log.insert(0, {
                     "time": now_str,
@@ -409,7 +561,7 @@ elif st.session_state.page == "dashboard":
             height=320,
             margin=dict(l=30, r=30, t=10, b=10)
         )
-        st.plotly_chart(fig_gauge, use_container_width=True)
+        st.plotly_chart(fig_gauge, width="stretch")
         st.markdown('</div>', unsafe_allow_html=True)
 
     with top_col2:
@@ -421,7 +573,7 @@ elif st.session_state.page == "dashboard":
             return f'color: {color}'
             
         styled_df = st.session_state.packet_history.style.map(color_status, subset=['Status'])
-        st.dataframe(styled_df, use_container_width=True, hide_index=True, height=320)
+        st.dataframe(styled_df, width="stretch", hide_index=True, height=320)
         st.markdown('</div>', unsafe_allow_html=True)
 
 
@@ -432,7 +584,6 @@ elif st.session_state.page == "dashboard":
     categories = ['Packet Size', 'IAT', 'Payload Entropy', 'Flow Symmetry']
 
     fig_radar = go.Figure()
-    # Baseline
     fig_radar.add_trace(go.Scatterpolar(
         r=dev_baseline,
         theta=categories,
@@ -441,7 +592,6 @@ elif st.session_state.page == "dashboard":
         line_color=NEON_BLUE,
         fillcolor='rgba(0, 207, 255, 0.2)'
     ))
-    # Current
     fig_radar.add_trace(go.Scatterpolar(
         r=current_features,
         theta=categories,
@@ -462,7 +612,7 @@ elif st.session_state.page == "dashboard":
         height=400,
         margin=dict(l=40, r=40, t=40, b=40)
     )
-    st.plotly_chart(fig_radar, use_container_width=True)
+    st.plotly_chart(fig_radar, width="stretch")
     st.markdown('</div>', unsafe_allow_html=True)
 
 
