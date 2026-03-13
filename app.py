@@ -6,6 +6,10 @@ Enterprise Fleet Manager Edition.
 Run with: streamlit run app.py
 """
 
+import os
+import smtplib
+from email.message import EmailMessage
+
 import streamlit as st
 import numpy as np
 import pandas as pd
@@ -14,8 +18,11 @@ import time
 import datetime
 import random
 import torch
+from dotenv import load_dotenv
 
+from auth import create_user, has_users, init_db, verify_user
 from engine import calculate_trust_score, calculate_jsd
+from forensics import generate_and_send_report
 from model import LSTMAutoencoder
 
 # ---------------------------------------------------------------------------
@@ -28,8 +35,24 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-NEON_GREEN = "#00fff2"
-NEON_RED   = "#ff007f"
+# --- ENVIRONMENT / AUTH SETUP ---
+load_dotenv()  # load .env file when present
+init_db()
+
+# If there are no users yet, bootstrap an admin account from env vars.
+if not has_users():
+    admin_email = os.environ.get("AEGIS_ADMIN_EMAIL")
+    admin_password = os.environ.get("AEGIS_ADMIN_PASSWORD")
+    if admin_email and admin_password:
+        try:
+            create_user(admin_email, admin_password)
+        except Exception:
+            pass
+
+# --- THEME COLORS ---
+# Using the origin/email branch's updated color palette
+NEON_GREEN = "#00ff88"
+NEON_RED   = "#ff2d55"
 NEON_BLUE  = "#00cfff"
 
 st.markdown(f"""
@@ -185,8 +208,101 @@ for k, v in _defaults.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
+# Authentication state (simple session-based guard)
+if "authenticated" not in st.session_state:
+    st.session_state.authenticated = False
+if "user_email" not in st.session_state:
+    st.session_state.user_email = None
+if "login_error" not in st.session_state:
+    st.session_state.login_error = None
+if "password_visible" not in st.session_state:
+    st.session_state.password_visible = False
+if "register_mode" not in st.session_state:
+    st.session_state.register_mode = False
+if "last_alert_sent" not in st.session_state:
+    st.session_state.last_alert_sent = {}
+
+
+def _render_login_page() -> None:
+    """Render a responsive login / onboarding screen and enforce authentication."""
+
+    # === FORM ===
+    email = st.text_input("Email", value=st.session_state.get("login_email", ""), placeholder="you@example.com")
+    pw_type = "default" if st.session_state.password_visible else "password"
+    password = st.text_input("Password", type=pw_type)
+    show_pw = st.checkbox("Show password", value=st.session_state.password_visible)
+    st.session_state.password_visible = show_pw
+
+    is_first_user = not has_users()
+
+    if st.session_state.register_mode:
+        st.info("Create a new account. Passwords are stored securely.")
+    elif is_first_user:
+        st.info("No users exist yet. This will create the first admin account.")
+
+    confirm_password = None
+    if st.session_state.register_mode:
+        confirm_password = st.text_input("Confirm Password", type=pw_type)
+
+    button_text = "Create account" if st.session_state.register_mode else "Sign in"
+    if st.button(button_text):
+        st.session_state.login_email = email
+        if not email:
+            st.session_state.login_error = "Email is required."
+        elif st.session_state.register_mode:
+            clean_email: str = email
+            if not password or not confirm_password:
+                st.session_state.login_error = "Password and confirmation are required."
+            elif password != confirm_password:
+                st.session_state.login_error = "Passwords do not match."
+            else:
+                try:
+                    create_user(clean_email, password)
+                    st.session_state.authenticated = True
+                    st.session_state.user_email = clean_email.strip().lower()
+                    st.session_state.page = "fleet"
+                    st.session_state.login_error = None
+                    st.success("Account created and logged in.")
+                    st.rerun()
+                except Exception as exc:
+                    st.session_state.login_error = str(exc)
+        else:
+            clean_email = email
+            if verify_user(clean_email, password):
+                st.session_state.authenticated = True
+                st.session_state.user_email = clean_email.strip().lower()
+                st.session_state.page = "fleet"
+                st.session_state.login_error = None
+                st.success("Login successful.")
+                st.rerun()
+            else:
+                st.session_state.login_error = "Invalid email or password."
+
+    if st.session_state.login_error:
+        st.error(st.session_state.login_error)
+
+    if st.session_state.register_mode:
+        if st.button("Already have an account? Sign in"):
+            st.session_state.register_mode = False
+            st.session_state.login_error = None
+            st.rerun()
+    else:
+        if st.button("Don't have an account? Register"):
+            st.session_state.register_mode = True
+            st.session_state.login_error = None
+            st.rerun()
+
+    if not st.session_state.authenticated:
+        st.stop()
+
+
+# Enforce authentication
+if not st.session_state.authenticated:
+    _render_login_page()
+
+
 # ---------------------------------------------------------------------------
-# MODEL
+# MODEL CACHING
 # ---------------------------------------------------------------------------
 @st.cache_resource
 def load_aegis_engine():
@@ -290,9 +406,13 @@ def render_fleet_page():
 # ===========================================================================
 def render_device_dashboard():
     dev_id      = st.session_state.active_device
-    device_info = IOT_REGISTRY[dev_id]
+    if not isinstance(dev_id, str) or dev_id not in IOT_REGISTRY:
+        st.error("No device selected or invalid device ID.")
+        st.stop()
+
+    device_info  = IOT_REGISTRY[dev_id]
     dev_baseline = device_info["baseline"]
-    disabled    = st.session_state.remediation_locked
+    disabled     = st.session_state.remediation_locked
 
     # -----------------------------------------------------------------------
     # DEFERRED STATE (must run before any widget is instantiated)
@@ -328,6 +448,16 @@ def render_device_dashboard():
             f"<h1 style='text-align:center;color:{NEON_BLUE} !important;'>🛡️ Aegis Control</h1>",
             unsafe_allow_html=True,
         )
+        st.markdown(
+            f"<p style='text-align:center; color: #aaa; margin-top: -10px;'>"
+            f"Logged in as <strong>{st.session_state.user_email or 'Unknown'}</strong></p>",
+            unsafe_allow_html=True,
+        )
+        if st.button("Log out", use_container_width=True, key="logout"):
+            st.session_state.authenticated = False
+            st.session_state.user_email = None
+            st.session_state.page = "fleet"
+            st.rerun()
         st.markdown("---")
 
         if st.button("← Back to Fleet", use_container_width=True, disabled=disabled):
@@ -351,6 +481,7 @@ def render_device_dashboard():
         </div>
         """, unsafe_allow_html=True)
 
+        # Use st.toggle from HEAD branch (more modern than checkbox)
         scan_active = st.toggle("📡 Live Scan Mode", value=True,
                                 key=f"scan_{dev_id}", disabled=disabled)
         st.markdown("---")
@@ -418,7 +549,8 @@ def render_device_dashboard():
     # INFERENCE
     # -----------------------------------------------------------------------
     current_features = np.array([val_pkt_size, val_iat, val_entropy, val_symmetry])
-    feature_sequence = np.tile(current_features, (1, 10, 1))
+    # Use corrected shape from origin/email: (1, 10, 4)
+    feature_sequence = np.tile(current_features, (10, 1))[np.newaxis, :, :]
     tensor_input     = torch.tensor(feature_sequence, dtype=torch.float32)
 
     with torch.no_grad():
@@ -442,21 +574,32 @@ def render_device_dashboard():
     if np.allclose(current_features, dev_baseline, atol=1e-8):
         mse, trust_score = 0.0, 100.0
 
-    is_safe      = trust_score >= 50
-    status_color = NEON_GREEN if is_safe else NEON_RED
+    # Three-tier status from origin/email branch
+    is_safe     = trust_score >= 50
+    is_critical = trust_score < 30
+
+    status_color = (
+        NEON_GREEN if is_safe else (NEON_RED if is_critical else "#ffb300")
+    )
 
     if is_safe:
         st.session_state.device_health[dev_id] = "Healthy"
         card_class     = "neon-safe"
         indicator_html = f"<span style='color:{NEON_GREEN};'>● ONLINE</span>"
-    else:
+    elif is_critical:
         st.session_state.device_health[dev_id] = "Compromised"
         card_class     = "neon-compromised pulse-red"
-        indicator_html = (f"<span style='color:{NEON_RED};"
-                          "animation:blinker 1s linear infinite;'>● CRITICAL</span>")
+        indicator_html = (
+            f"<span style='color:{NEON_RED};"
+            "animation:blinker 1s linear infinite;'>● CRITICAL</span>"
+        )
+    else:
+        st.session_state.device_health[dev_id] = "Compromised"
+        card_class     = "neon-compromised"
+        indicator_html = "<span style='color:#ffb300;'>● COMPROMISED</span>"
 
     # -----------------------------------------------------------------------
-    # HEADER
+    # HEADER — marquee ticker from HEAD branch
     # -----------------------------------------------------------------------
     st.markdown("""
     <div style="background:rgba(0,255,242,0.05);border:1px solid rgba(0,255,242,0.3);
@@ -484,7 +627,7 @@ def render_device_dashboard():
     """, unsafe_allow_html=True)
 
     # -----------------------------------------------------------------------
-    # CRITICAL ALERT + REMEDIATE BUTTON
+    # CRITICAL ALERT + FORENSIC EMAIL + REMEDIATE BUTTON
     # -----------------------------------------------------------------------
     if not is_safe:
         st.error(
@@ -493,18 +636,66 @@ def render_device_dashboard():
             "INITIATING NETWORK QUARANTINE.",
             icon="🚨",
         )
+
+        # Auto-generate forensic report for CRITICAL events (trust_score < 30)
+        if trust_score < 30 and st.session_state.user_email:
+            last_sent = st.session_state.last_alert_sent.get(dev_id)
+            cooldown  = datetime.timedelta(minutes=10)
+            now_utc   = datetime.datetime.utcnow()
+            should_send = last_sent is None or (now_utc - last_sent) > cooldown
+
+            if should_send:
+                try:
+                    device_data = {
+                        "device_id":           dev_id,
+                        "device_name":         device_info["name"],
+                        "sector":              device_info["sector"],
+                        "timestamp":           now_utc.isoformat(),
+                        "trust_score":         trust_score,
+                        "reconstruction_error": mse,
+                        "jsd_value":           jsd,
+                        "baseline_features":   dev_baseline,
+                        "current_features":    current_features.tolist(),
+                        "packet_history":      st.session_state.packet_history.to_dict("records"),
+                        "threat_log":          st.session_state.threat_log,
+                    }
+                    generate_and_send_report(
+                        recipient_email=st.session_state.user_email,
+                        device_data=device_data,
+                    )
+                    st.success("Forensic report generated and emailed to your account.")
+                    st.session_state.last_alert_sent[dev_id] = now_utc
+                except Exception as exc:
+                    st.warning(
+                        f"Failed to send forensic report email: {exc}. "
+                        "Check SMTP configuration and network connectivity."
+                    )
+
         _, col_remed = st.columns([8, 2])
         with col_remed:
             if st.button("🔧 Remediate Device", use_container_width=True,
                          key=f"remed_{dev_id}", disabled=disabled):
                 st.session_state.remediation_locked = True
-                prev_status = st.session_state.device_health.get(dev_id, "Unknown")
+                now_str      = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                prev_status  = st.session_state.device_health.get(dev_id, "Unknown")
+
+                # Append to remediation log (fleet page table)
+                st.session_state.remediation_log.append({
+                    "Timestamp":   now_str,
+                    "Device ID":   dev_id,
+                    "Device Name": device_info["name"],
+                    "Sector":      device_info["sector"],
+                    "Action Taken": "Quarantine Lifted & Params Reset",
+                })
+
+                # Append to audit log
                 st.session_state.audit_logs.insert(0, {
                     "device":          dev_id,
-                    "timestamp":       datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "timestamp":       now_str,
                     "event":           "Remediation Success",
                     "previous_status": prev_status,
                 })
+
                 with st.status("Running remediation protocol...", expanded=True) as rem:
                     st.write("Resetting device parameters...")
                     time.sleep(0.8)
@@ -582,7 +773,7 @@ def render_device_dashboard():
             )
             st.plotly_chart(fig_gauge, use_container_width=True)
 
-            # JSD sparkline
+            # JSD sparkline (from HEAD branch)
             fig_spark = go.Figure(go.Scatter(
                 y=st.session_state.jsd_history, mode="lines",
                 line={"color": NEON_GREEN, "width": 3, "shape": "spline"},
@@ -608,6 +799,7 @@ def render_device_dashboard():
             st.markdown('<div class="section-header">Live Packet Stream</div>',
                         unsafe_allow_html=True)
 
+            # Use .map() — correct for modern pandas (applymap was renamed)
             def _color_status(val):
                 return f'color: {NEON_RED if val == "Alert" else NEON_GREEN}'
 
@@ -622,9 +814,11 @@ def render_device_dashboard():
     # -----------------------------------------------------------------------
     stress_alert  = mse > 0.15
     stress_class  = "pulse-stress" if stress_alert else ""
-    stress_border = ("border:1px solid #ff007f;"
-                     if stress_alert
-                     else "border:1px solid rgba(0,255,242,0.2);")
+    stress_border = (
+        "border:1px solid #ff007f;"
+        if stress_alert
+        else "border:1px solid rgba(0,255,242,0.2);"
+    )
 
     st.markdown(
         f'<div class="glass-card {stress_class}" '
@@ -650,13 +844,15 @@ def render_device_dashboard():
             name=f"{device_info['type']} Baseline",
             line_color=NEON_BLUE, fillcolor="rgba(0,207,255,0.2)",
         ))
+        # Use clean ternary for fillcolor (fix from origin/email)
+        current_fill_color = (
+            "rgba(255, 45, 85, 0.3)" if not is_safe else "rgba(0, 255, 136, 0.3)"
+        )
         fig_radar.add_trace(go.Scatterpolar(
             r=current_features, theta=categories, fill="toself",
             name="Current Traffic",
             line_color=status_color,
-            fillcolor=(f"rgba({255 if not is_safe else 0},"
-                       f"{0 if not is_safe else 255},"
-                       f"{127 if not is_safe else 242},0.3)"),
+            fillcolor=current_fill_color,
         ))
         fig_radar.update_layout(
             polar={
@@ -763,7 +959,7 @@ def render_device_dashboard():
                 unsafe_allow_html=True,
             )
             with torch.no_grad():
-                out_m   = autoencoder(tensor_input)
+                out_m    = autoencoder(tensor_input)
                 mse_calc = float(torch.mean((tensor_input - out_m) ** 2).item())
             st.latex(
                 rf"f_t = \sigma(W_f \cdot [h_{{t-1}}, x_t] + b_f)"
@@ -811,7 +1007,7 @@ def render_device_dashboard():
 
 
 # ===========================================================================
-# ROUTER  —  single, clean dispatch; NO code outside these two branches
+# ROUTER  —  single, clean dispatch
 # ===========================================================================
 if st.session_state.page == "fleet":
     render_fleet_page()
