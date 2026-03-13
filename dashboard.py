@@ -344,31 +344,32 @@ def render_device_dashboard(autoencoder):
         if stress_alert else ""
     )
 
-    with glass_card(stress_extra[0], f"box-shadow:0 0 15px rgba(0,255,242,0.2);{stress_extra[1]}"):
-        section_header("Feature Drift Analysis", right_html)
+    with st.container():
+        with glass_card(stress_extra[0], f"box-shadow:0 0 15px rgba(0,255,242,0.2);{stress_extra[1]}"):
+            section_header("Feature Drift Analysis", right_html)
 
-        categories = ["Packet Size", "IAT", "Payload Entropy", "Flow Symmetry"]
-        col_radar, col_pulse = st.columns(2)
+            categories = ["Packet Size", "IAT", "Payload Entropy", "Flow Symmetry"]
+            col_radar, col_pulse = st.columns(2)
 
-        with col_radar:
-            st.plotly_chart(
-                _radar_chart(dev_baseline, current_features, categories, status_color, is_safe),
-                width="stretch", config={"displayModeBar": False},
-            )
+            with col_radar:
+                st.plotly_chart(
+                    _radar_chart(dev_baseline, current_features, categories, status_color, is_safe),
+                    width="stretch", config={"displayModeBar": False},
+                )
 
-        with col_pulse:
-            st.markdown(
-                "<div style='text-align:center;color:#00fff2;font-weight:600;margin-bottom:5px;"
-                "font-family:\"Source Code Pro\",monospace;font-size:0.9em;'>"
-                "Neural Health Monitor (Live Pulse)</div>", unsafe_allow_html=True,
-            )
-            st.plotly_chart(
-                _pulse_chart(st.session_state.pulse_mse_history, st.session_state.pulse_jsd_history),
-                width="stretch", config={"displayModeBar": False},
-            )
+            with col_pulse:
+                st.markdown(
+                    "<div style='text-align:center;color:#00fff2;font-weight:600;margin-bottom:5px;"
+                    "font-family:\"Source Code Pro\",monospace;font-size:0.9em;'>"
+                    "Neural Health Monitor (Live Pulse)</div>", unsafe_allow_html=True,
+                )
+                st.plotly_chart(
+                    _pulse_chart(st.session_state.pulse_mse_history, st.session_state.pulse_jsd_history),
+                    width="stretch", config={"displayModeBar": False},
+                )
 
-        st.caption("Dual-Sync Visualization: Mapping multidimensional geometric drift against "
-                   "temporal reconstruction residuals for 100% anomaly explainability.")
+            st.caption("Dual-Sync Visualization: Mapping multidimensional geometric drift against "
+                       "temporal reconstruction residuals for 100% anomaly explainability.")
 
     # --- Math engine toggle ---
     def _toggle_math():
@@ -403,19 +404,20 @@ def render_device_dashboard(autoencoder):
                 st.caption("If MSE > 0.1, the Twin is drifting from the Physical Device.")
 
     # --- Threat log ---
-    with glass_card():
-        section_header("Threat Log")
-        if not st.session_state.threat_log:
-            st.write("✅ System is secure. No recent threats logged.")
-        else:
-            for alert in st.session_state.threat_log:
-                st.markdown(
-                    f'<div style="border-left:4px solid {NEON_RED};padding:8px 12px;'
-                    f'margin-bottom:8px;background:rgba(255,0,127,0.08);border-radius:4px;">'
-                    f'<span style="color:#888;font-size:0.85em;">{alert["time"]}</span>'
-                    f'&nbsp;&nbsp;<span style="color:white;">{alert["msg"]}</span></div>',
-                    unsafe_allow_html=True,
-                )
+    with st.container():
+        with glass_card():
+            section_header("Threat Log")
+            if not st.session_state.threat_log:
+                st.write("✅ System is secure. No recent threats logged.")
+            else:
+                for alert in st.session_state.threat_log:
+                    st.markdown(
+                        f'<div style="border-left:4px solid {NEON_RED};padding:8px 12px;'
+                        f'margin-bottom:8px;background:rgba(255,0,127,0.08);border-radius:4px;">'
+                        f'<span style="color:#888;font-size:0.85em;">{alert["time"]}</span>'
+                        f'&nbsp;&nbsp;<span style="color:white;">{alert["msg"]}</span></div>',
+                        unsafe_allow_html=True,
+                    )
 
     if scan_active:
         time.sleep(1.0)
