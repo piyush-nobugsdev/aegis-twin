@@ -77,7 +77,32 @@ autoencoder = load_aegis_engine()
 # PAGE 1 — Fleet overview
 # ---------------------------------------------------------------------------
 def render_fleet_page():
-    # --- Navigation reading from query params ---
+    # --- Navigation reading from URL / Hack ---
+    def handle_hidden_click():
+        dev_id = st.session_state.get("hidden_click_input", "")
+        if dev_id in IOT_REGISTRY:
+            st.session_state.active_device  = dev_id
+            st.session_state.page           = "dashboard"
+            st.session_state.packet_history = pd.DataFrame(columns=["Time","Pkt Size","IAT","Entropy","Symmetry","Status"])
+            st.session_state.threat_log     = []
+            st.session_state.hidden_click_input = ""
+
+    st.markdown('''
+        <style>
+            div[data-testid="stTextInput"]:has(input[aria-label="Hidden Device Click"]) {
+                position: fixed;
+                top: -100px;
+                left: -100px;
+                opacity: 0;
+                height: 0;
+                width: 0;
+                overflow: hidden;
+                pointer-events: none;
+            }
+        </style>
+    ''', unsafe_allow_html=True)
+    st.text_input("Hidden Device Click", key="hidden_click_input", on_change=handle_hidden_click, label_visibility="collapsed")
+
     if "device" in st.query_params:
         dev_id = st.query_params.get("device")
         if dev_id in IOT_REGISTRY:
@@ -170,7 +195,7 @@ def render_fleet_page():
             status_style += " animation: blinker 1s linear infinite;"
         
         bg_color = "rgba(255,255,255,0.02)" if idx % 2 == 0 else "transparent"
-        rows_html += f'<tr class="registry-row" onclick="window.parent.location.href=\'?device={dev_id}\'" style="background: {bg_color}; border-bottom: 1px solid rgba(255,255,255,0.04); cursor: pointer; transition: background 0.2s ease;">' \
+        rows_html += f'<tr class="registry-row" onclick="openDevice(\'{dev_id}\')" style="background: {bg_color}; border-bottom: 1px solid rgba(255,255,255,0.04); cursor: pointer !important; transition: all 0.2s ease;">' \
                      f'<td style="padding: 12px; font-family: \'Source Code Pro\', monospace; color: #00cfff;">{info["icon"]} {dev_id}</td>' \
                      f'<td style="padding: 12px; color: white;">{info["name"]}</td>' \
                      f'<td style="padding: 12px; color: #888; font-size: 0.9em;">{info["type"]}</td>' \
@@ -230,11 +255,11 @@ def render_fleet_page():
     box-shadow: 0 5px 15px rgba(0,255,242,0.2);
     background: rgba(0,255,242,0.1);
   }}
-  .registry-row {{ transition: background 0.2s ease; cursor: pointer; }}
-  .registry-row:hover {{ background: rgba(0,255,242,0.06) !important; }}
+  .registry-row {{ transition: all 0.2s ease; cursor: pointer !important; }}
+  .registry-row:hover {{ background: rgba(0,255,242,0.12) !important; color: #00fff2 !important; }}
   table {{ width: 100%; border-collapse: collapse; font-size: 0.85rem; }}
   th {{ padding: 10px; text-align: left; color: #555; border-bottom: 1px solid rgba(0,255,242,0.2); position: sticky; top: 0; background: #080e1c; z-index: 1; }}
-  td {{ padding: 12px; }}
+  td {{ padding: 12px; cursor: pointer !important; }}
   @keyframes blinker {{ 50% {{ opacity: 0; }} }}
 </style>
 </head>
@@ -268,6 +293,26 @@ def render_fleet_page():
   </div>
 </div>
 <script>
+function openDevice(dev_id) {{
+  try {{
+    var parentDoc = window.parent.document;
+    var inputs = parentDoc.querySelectorAll('input[aria-label="Hidden Device Click"]');
+    var input = inputs[inputs.length - 1]; 
+    if (input) {{
+        var nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
+        nativeInputValueSetter.call(input, dev_id);
+        input.dispatchEvent(new Event('input', {{ bubbles: true }}));
+        input.dispatchEvent(new Event('change', {{ bubbles: true }}));
+        setTimeout(function() {{
+            input.dispatchEvent(new KeyboardEvent('keydown', {{ key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }}));
+        }}, 10);
+    }} else {{
+        window.parent.location.href = window.parent.location.pathname + '?device=' + encodeURIComponent(dev_id);
+    }}
+  }} catch(e) {{
+    window.parent.location.href = window.parent.location.pathname + '?device=' + encodeURIComponent(dev_id);
+  }}
+}}
 function filterRegistry() {{
   var query = document.getElementById('deviceSearch').value.toLowerCase();
   var rows  = document.querySelectorAll('.registry-row');
