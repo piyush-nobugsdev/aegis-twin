@@ -19,17 +19,18 @@ SESSION_DEFAULTS = {
     "page":                          "fleet",
     "active_device":                 None,
     "device_health":                 {k: "Healthy" for k in IOT_REGISTRY},
-    "packet_history":                pd.DataFrame(columns=["Time", "Pkt Size", "IAT", "Entropy", "Symmetry", "Status"]),
-    "threat_log":                    [],
-    "remediation_log":               [],
+    "packet_history":                {}, # dev_id -> df
+    "threat_log":                    {}, # dev_id -> list
+    "remediation_log":               {}, # dev_id -> list
+    "trust_scores":                  {}, # dev_id -> float
     "audit_logs":                    [],
     "remediation_locked":            False,
     "attack_step":                   {},
     "math_mode_active":              False,
-    "jsd_history":                   [0.0] * 10,
-    "pulse_mse_history":             [0.0] * 30,
-    "pulse_jsd_history":             [0.0] * 30,
-    "reconstruction_errors_history": [[0.0] * 20 for _ in range(4)],
+    "jsd_history":                   {}, # dev_id -> list
+    "pulse_mse_history":             {}, # dev_id -> list
+    "pulse_jsd_history":             {}, # dev_id -> list
+    "reconstruction_errors_history": {}, # dev_id -> list of lists
     # auth
     "authenticated":                 False,
     "user_email":                    None,
@@ -37,4 +38,8 @@ SESSION_DEFAULTS = {
     "password_visible":              False,
     "register_mode":                 False,
     "last_alert_sent":               {},
+    # hardware / sniffer
+    "sniffer_active":                False,
+    "hw_active_device":              None,
+    "hw_calibrating":                False,
 }
