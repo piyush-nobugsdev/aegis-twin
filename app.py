@@ -157,6 +157,7 @@ def render_fleet_page():
     healthy_count     = total_devices - compromised_count
 
     # Build map markers
+    rows_html = ""
     for idx, (dev_id, info) in enumerate(IOT_REGISTRY.items()):
         health         = st.session_state.device_health.get(dev_id, "Healthy")
         color          = NEON_GREEN if health == "Healthy" else NEON_RED
